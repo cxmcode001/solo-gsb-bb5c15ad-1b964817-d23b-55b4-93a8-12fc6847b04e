@@ -75,6 +75,18 @@ HTTP 日期（当前 Last-Modified 早于或等于条件时刻）判断是否未
 生成回源计划；未命中时完整复用 /client-range-decision 的
 200/206/416 决策，206 的 plan 仍可直接提交 /assemble。非法条件头返回
 带 loc（if_none_match / if_modified_since）的 422。
+
+POST /cache-write-decision 是代理在 /verify-fetch-batch 验收单个 206
+分块后的共享缓存写入决策入口：接收对象 URI、块闭区间、已确认强 ETag、
+原请求头以及上游 Cache-Control、Age、Vary。服务先对所有头值做语法校验
+（Cache-Control 按 HTTP 指令语法解析，支持含引号与转义的取值），非法
+头值一律返回带 loc 的 422；随后按序判定：遇 no-store、private、
+Vary: *、带 Authorization 且响应未显式允许共享（public / s-maxage /
+must-revalidate 均缺席）或 no-cache 时拒绝写入。可缓存时以 s-maxage
+优先于 max-age 取新鲜期，扣除 Age 得到剩余秒数，不足 1 秒即视为过期
+拒绝；无 s-maxage/max-age 时无法确定新鲜期，同样拒绝。通过时返回稳定
+缓存键——URI、块区间、ETag 与 Vary 指定的原请求头值（字段名大小写
+不敏感）经固定 JSON 规范化后的 SHA-256，不泄露头值原文。
 """
 
 from __future__ import annotations
@@ -3955,4 +3967,530 @@ def conditional_range_decision(
         object_length=req.object_length,
         condition=condition,
         decision=decision,
+    )
+
+
+# --------------------------- /cache-write-decision ---------------------------
+
+# 头值长度上限：抵御超长输入（HTTP 头本身通常远小于此）。
+_CACHE_WRITE_HEADER_MAX_LENGTH = 8192
+# 原请求头数量与字段名长度上限。
+_CACHE_WRITE_MAX_HEADERS = 100
+_CACHE_WRITE_HEADER_NAME_MAX_LENGTH = 256
+# 允许共享缓存覆盖 Authorization 默认禁存规则的响应指令（RFC 9111 §3.5）。
+_AUTH_SHARED_BYPASS_DIRECTIVES = ("public", "s-maxage", "must-revalidate")
+
+
+class CacheWriteDecisionRequest(BaseModel):
+    """/cache-write-decision 请求：单个已验收 206 分块的共享缓存写入判定要素。
+
+    cache_control / age / vary 省略或为 null 表示上游未携带对应响应头；
+    显式空字符串/空白属于非法头值（422）。request_headers 为原请求头的
+    字段名→取值映射，字段名大小写不影响判定与缓存键。
+    """
+
+    uri: str = Field(
+        ...,
+        min_length=1,
+        max_length=_CACHE_WRITE_HEADER_MAX_LENGTH,
+        description="对象 URI（缓存键组成部分；不得包含空白或控制字符）",
+    )
+    start: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="块起始字节偏移（含）"
+    )
+    end: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="块结束字节偏移（含），不得小于 start"
+    )
+    etag: str = Field(
+        ...,
+        min_length=1,
+        max_length=_CACHE_WRITE_HEADER_MAX_LENGTH,
+        description="/verify-fetch-batch 确认的强 ETag 原值（含引号，不得为弱标签）",
+    )
+    request_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description="原请求头（字段名大小写不敏感）；用于 Authorization 判定与 Vary 缓存键",
+    )
+    cache_control: str | None = Field(
+        None,
+        max_length=_CACHE_WRITE_HEADER_MAX_LENGTH,
+        description="上游 Cache-Control 响应头原值；省略/null 表示未携带",
+    )
+    age: str | None = Field(
+        None,
+        max_length=_CACHE_WRITE_HEADER_MAX_LENGTH,
+        description="上游 Age 响应头原值（delta-seconds）；省略/null 按 0 处理",
+    )
+    vary: str | None = Field(
+        None,
+        max_length=_CACHE_WRITE_HEADER_MAX_LENGTH,
+        description="上游 Vary 响应头原值；省略/null 表示无 Vary（缓存键不含请求头）",
+    )
+
+
+class VaryHeaderEntry(BaseModel):
+    """缓存键实际纳入的一个 Vary 指定请求头（字段名已小写化）。"""
+
+    name: str = Field(..., description="Vary 指定的请求头字段名（小写）")
+    value: str | None = Field(
+        ..., description="原请求中该头的取值（去首尾 OWS）；请求未携带时为 null"
+    )
+
+
+class CacheWriteDecisionResponse(BaseModel):
+    """共享缓存写入决策：判定、原因、剩余秒数与稳定缓存键。"""
+
+    cacheable: bool = Field(..., description="是否允许写入共享缓存")
+    reason: str = Field(
+        ...,
+        description="判定原因：cacheable / no_store / private / vary_star / "
+        "authorization_not_shared / no_cache / no_freshness_lifetime / expired",
+    )
+    remaining_seconds: int | None = Field(
+        ...,
+        description="可缓存时的剩余新鲜秒数（s-maxage 优先于 max-age，已扣除 Age，>= 1）；"
+        "拒绝写入时为 null",
+    )
+    cache_key: str | None = Field(
+        ...,
+        description="可缓存时的稳定缓存键（规范化要素的 SHA-256 十六进制）；拒绝写入时为 null",
+    )
+    vary_headers: list[VaryHeaderEntry] = Field(
+        default_factory=list,
+        description="缓存键实际纳入的 Vary 请求头（按字段名排序）；拒绝写入或无 Vary 时为空列表",
+    )
+
+
+class CacheWriteError(Exception):
+    """缓存写入决策的头值解析与校验失败，统一对应 HTTP 422。
+
+    loc 为可定位的字段路径："uri"、"end"、"etag"、"request_headers"、
+    "cache_control"、"age"、"vary"。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        loc: str,
+        *,
+        code: str = "cache_write_error",
+    ):
+        self.message = message
+        self.loc = loc
+        self.code = code
+        super().__init__(message)
+
+
+@app.exception_handler(CacheWriteError)
+async def cache_write_error_handler(request: Request, exc: CacheWriteError):
+    detail: dict[str, object] = {"message": exc.message, "loc": exc.loc}
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "detail": [detail]},
+    )
+
+
+def _reject_cache_write_chars(value: str, loc: str, code: str) -> None:
+    """拒绝头值中的 CR/LF 与其他 ASCII 控制字符（防折行/头部注入）。
+
+    水平制表符（0x09）是 HTTP 头值允许的 OWS，不在拒绝之列。
+    """
+    if any(ord(ch) < 0x20 and ch != "\t" or ord(ch) == 0x7F for ch in value):
+        raise CacheWriteError(
+            "头值不允许包含 CR/LF 或其他控制字符（拒绝折行与头部注入）",
+            loc,
+            code=code,
+        )
+
+
+def _is_http_token(text: str) -> bool:
+    """判断字符串是否为合法的 RFC 9110 token（ASCII tchar 序列）。"""
+    try:
+        raw = text.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return _TOKEN_RE.fullmatch(raw) is not None
+
+
+def _validate_cache_write_uri(raw: str) -> str:
+    """校验对象 URI：不得包含空白或控制字符（URI 不允许裸空格与 DEL）。"""
+    if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in raw):
+        raise CacheWriteError(
+            "uri 不允许包含空白或控制字符（URI 中的空格应使用 %20 编码）",
+            "uri",
+            code="invalid_uri",
+        )
+    return raw
+
+
+def _parse_confirmed_strong_etag(raw: str) -> str:
+    """校验已确认 ETag 必须是合法强 ETag，返回去首尾 OWS 后的原值（含引号）。"""
+    _reject_cache_write_chars(raw, "etag", "invalid_etag")
+    value = raw.strip(_OWS_STRIP)
+    if not value:
+        raise CacheWriteError(
+            "etag 不能为空：必须提供 /verify-fetch-batch 确认的强 ETag",
+            "etag",
+            code="missing_etag",
+        )
+    if value[:2].lower() == "w/":
+        raise CacheWriteError(
+            "etag 不允许是弱 ETag（W/ 前缀）：弱验证器不能保证字节级一致，"
+            "不得作为共享缓存的版本标识",
+            "etag",
+            code="weak_etag",
+        )
+    if not _STRONG_ETAG_RE.fullmatch(value):
+        raise CacheWriteError(
+            "etag 不是合法的强 ETag：必须为双引号包裹的 opaque-tag（如 "
+            '"v1"），不得包含空格、控制字符或裸引号',
+            "etag",
+            code="invalid_etag",
+        )
+    return value
+
+
+def _normalize_request_headers(raw: dict[str, str]) -> dict[str, str]:
+    """校验并规范化原请求头，返回 {小写字段名: 去首尾 OWS 的取值}。
+
+    字段名必须是合法 token；大小写不敏感查重（同一字段名以不同大小写重复
+    出现会被拒绝，避免缓存键歧义）；取值不得包含控制字符（允许 tab）。
+    """
+    if len(raw) > _CACHE_WRITE_MAX_HEADERS:
+        raise CacheWriteError(
+            f"request_headers 最多允许 {_CACHE_WRITE_MAX_HEADERS} 个字段，"
+            f"实际提供 {len(raw)} 个",
+            "request_headers",
+            code="too_many_headers",
+        )
+    normalized: dict[str, str] = {}
+    for name, value in raw.items():
+        if not name or len(name) > _CACHE_WRITE_HEADER_NAME_MAX_LENGTH:
+            raise CacheWriteError(
+                f"请求头字段名 {name!r} 为空或超过 "
+                f"{_CACHE_WRITE_HEADER_NAME_MAX_LENGTH} 字符",
+                "request_headers",
+                code="invalid_header_name",
+            )
+        if not _is_http_token(name):
+            raise CacheWriteError(
+                f"请求头字段名 {name!r} 不是合法的 HTTP token",
+                "request_headers",
+                code="invalid_header_name",
+            )
+        _reject_cache_write_chars(value, "request_headers", "invalid_header_value")
+        lowered = name.lower()
+        if lowered in normalized:
+            raise CacheWriteError(
+                f"请求头字段名 {name!r} 与此前字段仅大小写不同："
+                "字段名大小写不敏感，请勿重复提供",
+                "request_headers",
+                code="duplicate_header_name",
+            )
+        normalized[lowered] = value.strip(_OWS_STRIP)
+    return normalized
+
+
+def _parse_cache_control(raw: str) -> dict[str, str | None]:
+    """按 HTTP 指令语法解析 Cache-Control，返回 {小写指令名: 取值或 None}。
+
+    指令取值支持 token 与 quoted-string（含 quoted-pair 反转义），因此含
+    引号的值（如 max-age="60"、private="Set-Cookie"）都能正确解析；逗号
+    分隔在引号外进行。指令名大小写不敏感；同名指令重复时以第一次出现为准；
+    空成员（重复/尾随逗号）按 RFC 9110 列表规则忽略。任何语法错误抛
+    CacheWriteError(loc="cache_control")。
+    """
+    loc = "cache_control"
+    _reject_cache_write_chars(raw, loc, "invalid_cache_control")
+    text = raw
+    n = len(text)
+    if not text.strip(_OWS_STRIP):
+        raise CacheWriteError(
+            "Cache-Control 头为空白：省略/null 表示未携带，空字符串是非法头值",
+            loc,
+            code="invalid_cache_control",
+        )
+
+    def skip_ows(i: int) -> int:
+        while i < n and text[i] in _OWS_STRIP:
+            i += 1
+        return i
+
+    directives: dict[str, str | None] = {}
+    pos = 0
+    while True:
+        pos = skip_ows(pos)
+        if pos >= n:
+            break
+        if text[pos] == ",":
+            # 空成员（重复/前导逗号）：按 RFC 9110 列表规则忽略。
+            pos += 1
+            continue
+
+        # 指令名：token。
+        name_start = pos
+        while pos < n and text[pos] not in "=," and text[pos] not in _OWS_STRIP:
+            pos += 1
+        name = text[name_start:pos]
+        if not _is_http_token(name):
+            raise CacheWriteError(
+                f"Cache-Control 指令名 {name!r} 不是合法 token",
+                loc,
+                code="invalid_cache_control",
+            )
+        pos = skip_ows(pos)
+
+        value: str | None = None
+        if pos < n and text[pos] == "=":
+            pos += 1
+            pos = skip_ows(pos)
+            if pos < n and text[pos] == '"':
+                # quoted-string 取值：逐字符解析，支持 quoted-pair 反转义。
+                pos += 1
+                out: list[str] = []
+                while True:
+                    if pos >= n:
+                        raise CacheWriteError(
+                            f"Cache-Control 指令 {name!r} 的 quoted-string 未闭合"
+                            "（缺少结尾 '\"'）",
+                            loc,
+                            code="invalid_cache_control",
+                        )
+                    ch = text[pos]
+                    if ch == '"':
+                        pos += 1
+                        break
+                    if ch == "\\":
+                        pos += 1
+                        if pos >= n:
+                            raise CacheWriteError(
+                                f"Cache-Control 指令 {name!r} 的 quoted-pair "
+                                "转义被截断",
+                                loc,
+                                code="invalid_cache_control",
+                            )
+                        esc = text[pos]
+                        if not (
+                            esc == "\t"
+                            or 0x20 <= ord(esc) <= 0x7E
+                            or 0x80 <= ord(esc) <= 0xFF
+                        ):
+                            raise CacheWriteError(
+                                f"Cache-Control 指令 {name!r} 的 quoted-pair "
+                                "只能转义 HTAB/可见 ASCII/obs-text 字符",
+                                loc,
+                                code="invalid_cache_control",
+                            )
+                        out.append(esc)
+                        pos += 1
+                    else:
+                        code_point = ord(ch)
+                        if (
+                            ch == "\t"
+                            or 0x20 <= code_point <= 0x7E
+                            or 0x80 <= code_point <= 0xFF
+                        ):
+                            out.append(ch)
+                            pos += 1
+                        else:
+                            raise CacheWriteError(
+                                f"Cache-Control 指令 {name!r} 的 quoted-string "
+                                "包含非法字符",
+                                loc,
+                                code="invalid_cache_control",
+                            )
+                value = "".join(out)
+            else:
+                # token 取值。
+                value_start = pos
+                while pos < n and text[pos] != "," and text[pos] not in _OWS_STRIP:
+                    pos += 1
+                token_value = text[value_start:pos]
+                if not _is_http_token(token_value):
+                    raise CacheWriteError(
+                        f"Cache-Control 指令 {name!r} 的取值既不是合法 token "
+                        "也不是 quoted-string",
+                        loc,
+                        code="invalid_cache_control",
+                    )
+                value = token_value
+
+        lowered = name.lower()
+        if lowered not in directives:
+            directives[lowered] = value
+
+        pos = skip_ows(pos)
+        if pos >= n:
+            break
+        if text[pos] != ",":
+            raise CacheWriteError(
+                "Cache-Control 指令之间必须以逗号分隔（发现非法字符）",
+                loc,
+                code="invalid_cache_control",
+            )
+        pos += 1
+    return directives
+
+
+def _parse_cache_write_delta_seconds(value: str | None, directive: str) -> int:
+    """把 Cache-Control 指令取值解析为 delta-seconds（非负十进制整数）。"""
+    if value is None or not value.isascii() or not value.isdigit():
+        raise CacheWriteError(
+            f"Cache-Control 指令 {directive} 需要非负整数取值（delta-seconds），"
+            f"实际为 {value!r}",
+            "cache_control",
+            code="invalid_cache_control",
+        )
+    return int(value)
+
+
+def _parse_cache_write_age(raw: str) -> int:
+    """解析 Age 头为 delta-seconds；非法取值抛 loc="age" 的 422。"""
+    _reject_cache_write_chars(raw, "age", "invalid_age")
+    text = raw.strip(_OWS_STRIP)
+    if not text or not text.isascii() or not text.isdigit():
+        raise CacheWriteError(
+            "Age 头必须是非负整数（delta-seconds），"
+            f"实际为 {raw.strip(_OWS_STRIP)!r}",
+            "age",
+            code="invalid_age",
+        )
+    return int(text)
+
+
+def _parse_cache_write_vary(raw: str) -> tuple[bool, list[str]]:
+    """解析 Vary 头，返回 (是否含 "*", 小写去重后的字段名列表)。
+
+    成员必须是 "*" 或合法 token；空成员（重复/尾随逗号）按 RFC 9110 列表
+    规则忽略；字段名大小写不敏感（去重后小写返回）。
+    """
+    loc = "vary"
+    _reject_cache_write_chars(raw, loc, "invalid_vary")
+    text = raw.strip(_OWS_STRIP)
+    if not text:
+        raise CacheWriteError(
+            "Vary 头为空白：省略/null 表示未携带，空字符串是非法头值",
+            loc,
+            code="invalid_vary",
+        )
+    has_star = False
+    names: list[str] = []
+    seen: set[str] = set()
+    for member in text.split(","):
+        token = member.strip(_OWS_STRIP)
+        if not token:
+            continue  # 空成员：按 RFC 9110 列表规则忽略
+        if token == "*":
+            has_star = True
+            continue
+        if not _is_http_token(token):
+            raise CacheWriteError(
+                f"Vary 成员 {token!r} 非法：必须是 '*' 或合法的请求头字段名 token",
+                loc,
+                code="invalid_vary",
+            )
+        lowered = token.lower()
+        if lowered not in seen:
+            seen.add(lowered)
+            names.append(lowered)
+    return has_star, names
+
+
+def _deny_cache_write(reason: str) -> CacheWriteDecisionResponse:
+    """构造拒绝写入的决策响应（无剩余秒数、无缓存键）。"""
+    return CacheWriteDecisionResponse(
+        cacheable=False,
+        reason=reason,
+        remaining_seconds=None,
+        cache_key=None,
+        vary_headers=[],
+    )
+
+
+@app.post("/cache-write-decision", response_model=CacheWriteDecisionResponse)
+def cache_write_decision(
+    req: CacheWriteDecisionRequest,
+) -> CacheWriteDecisionResponse:
+    """判定单个已验收 206 分块能否写入共享缓存，并给出稳定缓存键。
+
+    先对全部头值做语法校验（非法值一律 422，先于任何判定），再按固定
+    顺序判定：no-store → private → Vary:* → Authorization 未显式允许共享
+    → no-cache → 无新鲜期指令 → 已过期。全部通过时以 s-maxage 优先于
+    max-age 取新鲜期、扣除 Age 得到剩余秒数，并输出由 URI、块区间、
+    ETag 与 Vary 指定请求头值规范化后的 SHA-256 缓存键。
+    """
+    # 1. 语法校验：任何非法头值都是可定位的 422，不做基于可疑输入的判定。
+    uri = _validate_cache_write_uri(req.uri)
+    if req.end < req.start:
+        raise CacheWriteError(
+            f"块区间 [{req.start},{req.end}] 非法：end 不得小于 start",
+            "end",
+            code="invalid_range",
+        )
+    etag = _parse_confirmed_strong_etag(req.etag)
+    headers = _normalize_request_headers(req.request_headers)
+    directives = (
+        _parse_cache_control(req.cache_control)
+        if req.cache_control is not None
+        else {}
+    )
+    # s-maxage / max-age 的取值合法性在判定前统一校验（delta-seconds）。
+    s_maxage = (
+        _parse_cache_write_delta_seconds(directives["s-maxage"], "s-maxage")
+        if "s-maxage" in directives
+        else None
+    )
+    max_age = (
+        _parse_cache_write_delta_seconds(directives["max-age"], "max-age")
+        if "max-age" in directives
+        else None
+    )
+    age = _parse_cache_write_age(req.age) if req.age is not None else 0
+    vary_star, vary_names = (
+        _parse_cache_write_vary(req.vary) if req.vary is not None else (False, [])
+    )
+
+    # 2. 按固定顺序判定拒绝条件（任一命中即拒绝写入）。
+    if "no-store" in directives:
+        return _deny_cache_write("no_store")
+    if "private" in directives:
+        return _deny_cache_write("private")
+    if vary_star:
+        return _deny_cache_write("vary_star")
+    if "authorization" in headers and not any(
+        name in directives for name in _AUTH_SHARED_BYPASS_DIRECTIVES
+    ):
+        return _deny_cache_write("authorization_not_shared")
+    if "no-cache" in directives:
+        return _deny_cache_write("no_cache")
+
+    # 3. 新鲜期：共享缓存以 s-maxage 优先于 max-age（RFC 9111 §5.2.2.10）。
+    lifetime = s_maxage if s_maxage is not None else max_age
+    if lifetime is None:
+        return _deny_cache_write("no_freshness_lifetime")
+    remaining = lifetime - age
+    if remaining <= 0:
+        return _deny_cache_write("expired")
+
+    # 4. 可缓存：构造稳定缓存键。Vary 指定的请求头按字段名排序纳入，
+    #    未携带的头以 null 表示（与空字符串取值区分）；固定 JSON 规范化
+    #    保证同一输入在任何进程中都得到同一个键。
+    vary_entries = [(name, headers.get(name)) for name in sorted(vary_names)]
+    key_material = {
+        "uri": uri,
+        "start": req.start,
+        "end": req.end,
+        "etag": etag,
+        "vary": [[name, value] for name, value in vary_entries],
+    }
+    cache_key = hashlib.sha256(canonical_json(key_material)).hexdigest()
+    return CacheWriteDecisionResponse(
+        cacheable=True,
+        reason="cacheable",
+        remaining_seconds=remaining,
+        cache_key=cache_key,
+        vary_headers=[
+            VaryHeaderEntry(name=name, value=value)
+            for name, value in vary_entries
+        ],
     )
