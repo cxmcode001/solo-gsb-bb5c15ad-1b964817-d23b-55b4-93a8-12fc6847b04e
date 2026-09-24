@@ -54,6 +54,14 @@
   条件命中返回 `304` 与当前验证器（不解析 Range、不生成回源计划），未命中则
   完整复用 `200`/`206`/`416` 决策，`206` 的 `plan` 仍可直接提交
   `/assemble`；非法条件头返回带 `loc` 的 `422`。
+- `POST /cache-write-decision`：在 `/verify-fetch-batch` 验收单个 206 分块后，
+  判断该块能否写入**共享缓存**。输入对象 URI、块区间、已确认强 ETag、原请求头
+  与上游 `Cache-Control`/`Age`/`Vary`；按 HTTP 指令语法解析含引号的取值，遇
+  `no-store`、`private`、`Vary: *` 或请求带 `Authorization` 而响应未显式允许
+  共享（`must-revalidate`/`public`/`s-maxage`）时拒绝。可缓存时 `s-maxage`
+  优先于 `max-age`，扣除 `Age` 得剩余秒数（过期即拒绝）；稳定缓存键包含 URI、
+  区间、ETag 与 `Vary` 指定的原请求头值（字段名大小写不敏感）。非法头值返回
+  带 `loc` 的 `422`。
 
 ## Docker 一键启动
 
@@ -1124,6 +1132,136 @@ HTTP `422`。
 python examples/conditional_range_decision_example.py
 ```
 
+### `POST /cache-write-decision`
+
+在 [`/verify-fetch-batch`](#post-verify-fetch-batch) 验收单个 206 分块后，
+用本端点判断该块能否写入**共享缓存**，并取得可缓存时的剩余新鲜秒数与
+**稳定缓存键**。本端点不需要任何环境变量配置，服务地址同为
+`http://127.0.0.1:8080`。
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `uri` | 对象 URI（1–8192 字符，不得含控制字符；原样进入缓存键，不做规范化） |
+| `start` / `end` | 分块闭区间字节偏移（`0 <= start <= end`，通常取自 `/verify-fetch-batch` 验收过的块） |
+| `etag` | 已确认的**强** ETag 头原值（如 `"\"v3\""`，含引号）；弱标签（`W/` 前缀）与非法值返回 `422` |
+| `request_headers` | 代理收到的原请求头 `{字段名: 值}`（可空）；字段名大小写不敏感，用于 `Authorization` 检查与 `Vary` 取值 |
+| `cache_control` | 上游 `Cache-Control` 头原值；省略/`null` 表示未携带 |
+| `age` | 上游 `Age` 头原值（delta-seconds）；省略/`null` 按 0 处理 |
+| `vary` | 上游 `Vary` 头原值；省略/`null` 表示未携带 |
+
+请求示例：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/cache-write-decision \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "uri": "https://objects.example.com/bucket/file.bin",
+    "start": 0,
+    "end": 99,
+    "etag": "\"v3-strong\"",
+    "request_headers": {"Accept-Encoding": "gzip"},
+    "cache_control": "s-maxage=120, max-age=60, public",
+    "age": "20",
+    "vary": "Accept-Encoding"
+  }'
+```
+
+```json
+{
+  "cacheable": true,
+  "reason": "cacheable",
+  "remaining_seconds": 100,
+  "cache_key": "9c2e…（64 位十六进制）",
+  "vary_headers": ["accept-encoding"]
+}
+```
+
+#### 判定规则
+
+先校验全部头值语法（任一非法即 `422`，先于任何判定），再按以下顺序判定
+（命中即返回，`cacheable`/`reason` 都是 **HTTP 200 的正常判定结果**）：
+
+1. **`no-store`**（RFC 9111 §5.2.2.5）：响应禁止存储 → `no_store`；
+2. **`private`**（§5.2.2.7）：响应仅限私有缓存 → `private`（含
+   `private="Set-Cookie"` 等限定字段形式）；
+3. **`Vary: *`**（RFC 9110 §12.5.5）：无法构造可复用的缓存键 → `vary_star`
+   （`*` 与其他成员混排时同样生效）；
+4. **`Authorization`**（§3.5）：原请求携带 `Authorization`（字段名大小写
+   不敏感）而响应 `Cache-Control` 未显式允许共享缓存——即不含
+   `must-revalidate`、`public`、`s-maxage` 任一指令——
+   → `authorization_not_shareable`；
+5. **新鲜度**：`s-maxage` 优先于 `max-age`（§5.2.2.10）；两者皆无时不做
+   启发式缓存 → `no_explicit_freshness`；`剩余秒数 = 新鲜度 - Age`，
+   `<= 0` 即过期 → `expired`；
+6. 以上都未命中 → `cacheable`，返回剩余秒数与缓存键。
+
+`Cache-Control` 按 HTTP 指令语法解析：`#( token [ "=" ( token /
+quoted-string ) ] )`——成员以逗号分隔（**引号内的逗号不分隔**），成员
+前后及 `=` 周围允许 OWS/BWS，空成员按 RFC 9110 §5.6.1.1 忽略，
+quoted-string 支持 `\"`、`\\` 等 quoted-pair 转义；指令名大小写不敏感。
+`max-age`/`s-maxage` 的取值必须是 delta-seconds（token 或引号包裹形式均
+可），同一指令重复出现按 `duplicate_cache_directive` 拒绝（共享缓存不得
+猜测冲突的新鲜度语义）。`no-cache` 不阻止写入（仅要求使用时再验证）；
+未知扩展指令一律忽略。
+
+#### 缓存键构造
+
+`cache_key` 是对以下规范化材料做固定 JSON 序列化（键按字典序排序、无多余
+空白、UTF-8）后的 **SHA-256 十六进制**：
+
+```json
+{
+  "uri": "<对象 URI 原值>",
+  "start": 0,
+  "end": 99,
+  "etag": "<去首尾 OWS 后的强 ETag，含引号>",
+  "vary": [["<小写字段名>", "<原请求头值 或 null>"], ...]
+}
+```
+
+- `vary` 列表按 `Vary` 指定的字段名（小写、去重、字典序）排列，取值取自
+  `request_headers`：字段名匹配**大小写不敏感**（大小写不同的同名头按
+  接收顺序以 `", "` 合并），值仅去首尾 OWS、保留原大小写与内部空白；
+  请求中缺失的头以 `null` 参与（与空字符串取值产生不同的键）；
+- 因此**字段名大小写、Vary 成员的大小写与顺序、ETag 首尾空白都不影响
+  缓存键**，而 URI、区间、ETag 或任一 Vary 取值变化都会得到不同的键；
+- 不可缓存时 `cache_key` 与 `remaining_seconds` 均为 `null`。
+
+响应中的 `vary_headers` 回显 `Vary` 解析出的小写字段名列表（无 `Vary`
+或 `Vary: *` 时为空列表），便于核对缓存键成分。
+
+#### 错误响应
+
+非法头值统一返回 `422`，响应体为
+`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`，`loc`
+精确定位（`uri` / `etag` / `cache_control` / `age` / `vary` /
+`request_headers.<字段名>`）。主要错误码：
+
+| error | 含义 |
+| --- | --- |
+| `invalid_uri` | `uri` 为空白串或含控制字符 |
+| `missing_etag` | `etag` 为空白 |
+| `weak_etag` | `etag` 为弱标签（`W/` 前缀） |
+| `invalid_etag` | `etag` 不是合法的强 opaque-tag |
+| `invalid_cache_control` | `Cache-Control` 语法非法（未闭合引号、非法 token、`max-age`/`s-maxage` 非数字或缺取值、空白/空指令列表等） |
+| `duplicate_cache_directive` | `max-age` 或 `s-maxage` 重复出现 |
+| `invalid_age` | `Age` 不是 delta-seconds（非负十进制整数） |
+| `invalid_vary` | `Vary` 成员非法、为空白或不含任何有效成员 |
+| `invalid_request_header` | 原请求头字段名非合法 token 或取值超长 |
+| `malformed_header` | 头值含 CR/LF 等控制字符（拒绝折行与头部注入） |
+
+字段缺失、类型错误（如 `end < start`、`start` 为负）与其他端点一致返回
+`422 invalid_request`。
+
+完整的 验收 → 逐块判定 → 缓存键稳定性演示示例见
+[`examples/cache_write_decision_example.py`](examples/cache_write_decision_example.py)：
+
+```
+python examples/cache_write_decision_example.py
+```
+
 ## 错误响应
 
 业务请求/语义错误统一返回 HTTP `422`：
@@ -1148,6 +1286,12 @@ python examples/conditional_range_decision_example.py
   `invalid_if_none_match` / `invalid_if_modified_since`）；`304` 同样是
   正常决策结果（HTTP 200 返回），见
   [`POST /conditional-range-decision`](#post-conditional-range-decision) 一节；
+- `/cache-write-decision` 的头值错误采用 `detail[0].loc` 可定位结构
+  （`uri`、`etag`、`cache_control`、`age`、`vary`、
+  `request_headers.<字段名>`）；注意可缓存/不可缓存都是**正常判定结果**
+  （HTTP 200 返回，结论在响应体 `cacheable`/`reason` 中），只有头值非法/
+  字段错误才是 HTTP `422`，错误码与含义见
+  [`POST /cache-write-decision`](#post-cache-write-decision) 一节；
 - `/plan` 范围不可满足：`{"error": "unsatisfiable", "message": ..., "range_index": ...}`；
 - `/assemble` 组装错误：`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`，
   其中 `loc` 指向出错的字段路径（如 `contents[2].data_b64`、
